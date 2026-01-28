@@ -15,12 +15,57 @@ from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 
 from einops import rearrange
 
-from flash_attn.modules.mha import MHA, ParallelMHA
-from flash_attn.modules.mlp import Mlp, FusedMLP, ParallelFusedMLP
-from flash_attn.modules.block import Block
-from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
-from flash_attn.utils.generation import GenerationMixin
-from flash_attn.utils.distributed import sync_shared_params, all_gather_raw
+# ==================== Optioonal Flash Attention loading ====================
+try:
+    from flash_attn.modules.mha import MHA, ParallelMHA
+    FLASH_ATTN_MHA_AVAILABLE = True
+except ImportError:
+    MHA = None
+    ParallelMHA = None
+    FLASH_ATTN_MHA_AVAILABLE = False
+
+try:
+    from flash_attn.modules.mlp import Mlp as FAMlp, FusedMLP, ParallelFusedMLP
+    FLASH_ATTN_MLP_AVAILABLE = True
+except ImportError:
+    FAMlp = None
+    FusedMLP = None
+    ParallelFusedMLP = None
+    FLASH_ATTN_MLP_AVAILABLE = False
+
+try:
+    from flash_attn.modules.block import Block
+    FLASH_ATTN_BLOCK_AVAILABLE = True
+except ImportError:
+    Block = None
+    FLASH_ATTN_BLOCK_AVAILABLE = False
+
+try:
+    from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
+    FLASH_ATTN_EMBEDDING_AVAILABLE = True
+except ImportError:
+    GPT2Embeddings = None
+    ParallelGPT2Embeddings = None
+    FLASH_ATTN_EMBEDDING_AVAILABLE = False
+
+try:
+    from flash_attn.utils.generation import GenerationMixin
+    FLASH_ATTN_GENERATION_AVAILABLE = True
+except ImportError:    
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except ImportError:        
+        class GenerationMixin:
+            pass
+    FLASH_ATTN_GENERATION_AVAILABLE = False
+
+try:
+    from flash_attn.utils.distributed import sync_shared_params, all_gather_raw
+    FLASH_ATTN_DISTRIBUTED_AVAILABLE = True
+except ImportError:
+    sync_shared_params = None
+    all_gather_raw = None
+    FLASH_ATTN_DISTRIBUTED_AVAILABLE = False
 
 try:
     from flash_attn.ops.fused_dense import ColumnParallelLinear
@@ -34,6 +79,95 @@ except ImportError:
 
 from src.utils import instantiate
 import src.utils.registry as registry
+
+if not FLASH_ATTN_MLP_AVAILABLE:
+    class FAMlp(nn.Module):
+        def __init__(self, in_features, hidden_features=None, out_features=None, 
+                     activation=F.gelu, bias=True, device=None, dtype=None):
+            factory_kwargs = {'device': device, 'dtype': dtype}
+            super().__init__()
+            out_features = out_features or in_features
+            hidden_features = hidden_features or in_features
+            self.fc1 = nn.Linear(in_features, hidden_features, bias=bias, **factory_kwargs)
+            self.activation = activation
+            self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, **factory_kwargs)
+
+        def forward(self, x):
+            x = self.fc1(x)
+            x = self.activation(x)
+            x = self.fc2(x)
+            return x
+
+if not FLASH_ATTN_BLOCK_AVAILABLE:
+    class Block(nn.Module):
+        def __init__(self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, 
+                     prenorm=True, resid_dropout1=0.0, resid_dropout2=0.0,
+                     fused_dropout_add_ln=False, residual_in_fp32=False, 
+                     sequence_parallel=False, mark_shared_params=False, **kwargs):
+            super().__init__()
+            self.prenorm = prenorm
+            self.mixer = mixer_cls(dim)
+            self.mlp = mlp_cls(dim)
+            self.norm1 = norm_cls(dim)
+            self.norm2 = norm_cls(dim)
+            self.dropout1 = nn.Dropout(resid_dropout1)
+            self.dropout2 = nn.Dropout(resid_dropout2)
+            self.residual_in_fp32 = residual_in_fp32
+            self.fused_dropout_add_ln = fused_dropout_add_ln and dropout_add_layer_norm is not None
+            
+        def forward(self, hidden_states, residual=None, mixer_kwargs=None):
+            if self.prenorm:
+                # Pre-norm: LN -> Mixer -> Dropout -> Add -> LN -> MLP -> Dropout -> Add
+                normed = self.norm1(hidden_states)
+                if mixer_kwargs is None:
+                    mixer_out = self.mixer(normed)
+                else:
+                    mixer_out = self.mixer(normed, **mixer_kwargs)
+                
+                if residual is None:
+                    residual = hidden_states
+                hidden_states = residual + self.dropout1(mixer_out)
+                
+                normed = self.norm2(hidden_states)
+                mlp_out = self.mlp(normed)
+                residual = hidden_states
+                hidden_states = residual + self.dropout2(mlp_out)
+            else:
+                # Post-norm
+                raise NotImplementedError("Post-norm not implemented for fallback Block")
+            
+            return hidden_states, residual
+
+if not FLASH_ATTN_EMBEDDING_AVAILABLE:
+    class GPT2Embeddings(nn.Module):
+        def __init__(self, embed_dim, vocab_size, max_position_embeddings=0, 
+                     device=None, dtype=None):
+            factory_kwargs = {'device': device, 'dtype': dtype}
+            super().__init__()
+            self.word_embeddings = nn.Embedding(vocab_size, embed_dim, **factory_kwargs)
+            self.position_embeddings = nn.Embedding(max_position_embeddings, embed_dim, **factory_kwargs) \
+                if max_position_embeddings > 0 else None
+            
+        def forward(self, input_ids, position_ids=None, combine_batch_seqlen_dim=False):
+            # combine_batch_seqlen_dim
+            x = self.word_embeddings(input_ids)
+            if self.position_embeddings is not None and position_ids is not None:
+                x = x + self.position_embeddings(position_ids)
+            return x
+    
+    class ParallelGPT2Embeddings(GPT2Embeddings):        
+        def __init__(self, embed_dim, vocab_size, max_position_embeddings=0, 
+                     process_group=None, sequence_parallel=False, device=None, dtype=None):
+            super().__init__(embed_dim, vocab_size, max_position_embeddings, device, dtype)
+            self.process_group = process_group
+            self.sequence_parallel = sequence_parallel
+
+if not FLASH_ATTN_DISTRIBUTED_AVAILABLE:
+    def sync_shared_params(module, process_group):        
+        pass
+    
+    def all_gather_raw(tensor, process_group):        
+        return tensor, None
 
 
 class CheckpointedModule(torch.nn.Module):
@@ -68,6 +202,14 @@ def create_mixer_cls(
         )
         if not fused_bias_fc:
             assert process_group is None, "TensorParallel MHA requires fused_bias_fc"
+        
+        # 檢查是否有 Flash Attention
+        if not FLASH_ATTN_MHA_AVAILABLE:
+            raise ImportError(
+                "Flash Attention is required for attention layers but not installed. "
+                "Please install flash-attn or avoid using attn_layer_idx."
+            )
+            
         mha_cls = MHA if process_group is None else ParallelMHA
         # ParallelMHA doesn't take 'fused_bias_fc', it is assumed that we fuse matmul + bias
         if process_group is not None:
@@ -93,9 +235,6 @@ def create_mixer_cls(
             **factory_kwargs,
             **parallel_kwargs,
         )
-        # mixer_cls = partial(ssm_cls, layer_idx=layer_idx,
-        #                     **(ssm_cfg if ssm_cfg is not None else {}),
-        #                     **parallel_kwargs, **factory_kwargs)
     return mixer_cls
 
 
@@ -114,14 +253,16 @@ def create_mlp_cls(
     if process_group is not None:
         assert fused_mlp, "Tensor Parallel is only implemented for FusedMLP"
 
-    if not fused_mlp and not identity_mlp:
+    if not fused_mlp and not identity_mlp:       
         mlp_cls = partial(
-            Mlp,
+            FAMlp if FLASH_ATTN_MLP_AVAILABLE else FAMlp,
             hidden_features=inner_dim,
             activation=partial(F.gelu, approximate="tanh"),
             **factory_kwargs,
         )
     elif fused_mlp:
+        if not FLASH_ATTN_MLP_AVAILABLE:
+            raise ImportError("FusedMLP requires flash-attn but it's not installed")
         mlp_cls = FusedMLP if process_group is None else ParallelFusedMLP
         parallel_kwargs = (
             {"process_group": process_group, "sequence_parallel": sequence_parallel}
@@ -177,6 +318,10 @@ def create_block(
         **factory_kwargs,
     )
     norm_cls = partial(nn.LayerNorm, eps=layer_norm_epsilon, **factory_kwargs)
+        
+    if not FLASH_ATTN_BLOCK_AVAILABLE and (fused_dropout_add_ln or process_group is not None):
+        print(f"Warning: Flash Attention Block not available, using fallback implementation")
+    
     block = Block(
         d_model,
         mixer_cls,
@@ -281,10 +426,14 @@ class LMBackbone(nn.Module):
         self.residual_in_fp32 = residual_in_fp32
 
         if process_group is None:
+            if GPT2Embeddings is None:
+                raise ImportError("GPT2Embeddings not available")
             self.embeddings = GPT2Embeddings(
                 d_model, vocab_size, max_position_embeddings, **factory_kwargs
             )
         else:
+            if ParallelGPT2Embeddings is None:
+                raise ImportError("ParallelGPT2Embeddings not available")
             self.embeddings = ParallelGPT2Embeddings(
                 d_model,
                 vocab_size,
