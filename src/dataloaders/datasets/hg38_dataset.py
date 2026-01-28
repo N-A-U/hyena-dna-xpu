@@ -146,6 +146,7 @@ class HG38Dataset(torch.utils.data.Dataset):
         return_augs=False,
         replace_N_token=False,  # replace N token with pad token
         pad_interval = False,  # options for different padding
+        preload_to_xpu=False,
     ):
 
         self.max_length = max_length
@@ -155,8 +156,8 @@ class HG38Dataset(torch.utils.data.Dataset):
         self.return_augs = return_augs
         self.add_eos = add_eos
         self.replace_N_token = replace_N_token  
-        self.pad_interval = pad_interval         
-
+        self.pad_interval = pad_interval
+        
         bed_path = Path(bed_file)
         assert bed_path.exists(), 'path to .bed file must exist'
 
@@ -173,6 +174,92 @@ class HG38Dataset(torch.utils.data.Dataset):
             rc_aug = rc_aug,
             pad_interval = pad_interval,
         )
+        self.preload_to_xpu = preload_to_xpu
+        self.xpu_data = None
+        if self.preload_to_xpu:
+            self._preload_to_xpu()
+
+    def _preload_to_xpu(self):
+        if not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+            print("Warning: XPU not available, skipping preload")
+            return
+        
+        print(f"Starting XPU preload for {len(self.df)} samples...")
+        all_data = []
+        all_targets = []
+        
+        for idx in range(len(self.df)):
+            try:
+                row = self.df.iloc[idx]
+                chr_name, start, end = row['chr_name'], row['start'], row['end']
+                
+                seq = self.fasta(chr_name, start, end, max_length=self.max_length, return_augs=False)
+                
+                # Tokenize
+                if self.tokenizer_name == 'char':
+                    seq_tokens = self.tokenizer(seq,
+                        add_special_tokens=True if self.add_eos else False,
+                        padding="max_length",
+                        max_length=self.max_length,
+                        truncation=True,
+                    )
+                    seq_ids = seq_tokens["input_ids"]
+                elif self.tokenizer_name == 'bpe':
+                    seq_tokens = self.tokenizer(seq, 
+                        padding="max_length",
+                        max_length=self.pad_max_length,
+                        truncation=True,
+                    )
+                    if self.add_eos:
+                        seq_ids = seq_tokens["input_ids"][1:]
+                    else:
+                        seq_ids = seq_tokens["input_ids"][1:-1]
+                else:
+                    raise ValueError(f"Unknown tokenizer: {self.tokenizer_name}")
+                
+                seq_tensor = torch.LongTensor(seq_ids)
+                
+                if self.replace_N_token:
+                    seq_tensor = self.replace_value(seq_tensor, self.tokenizer._vocab_str_to_int['N'], self.tokenizer.pad_token_id)
+                
+                data = seq_tensor[:-1].clone()
+                target = seq_tensor[1:].clone()
+                               
+                if data.numel() == 0 or target.numel() == 0:
+                    print(f"Warning: Empty tensor at idx {idx}, skipping")
+                    continue
+                
+                all_data.append(data)
+                all_targets.append(target)
+                
+                if idx % 1000 == 0:
+                    print(f"Processed {idx}/{len(self.df)} samples, data list size: {len(all_data)}")
+                    
+            except Exception as e:
+                print(f"Error processing idx {idx}: {e}")
+                continue
+              
+        if len(all_data) == 0:
+            raise RuntimeError("No data was loaded! Check dataset and tokenizer configuration.")
+        
+        print(f"Stacking {len(all_data)} tensors...")
+        cpu_data = torch.stack(all_data)
+        cpu_targets = torch.stack(all_targets)
+        
+        print(f"Moving to XPU... (CPU tensor size: {cpu_data.element_size() * cpu_data.nelement() / 1e9:.2f} GB)")
+        self.xpu_data = cpu_data.to("xpu")
+        self.xpu_targets = cpu_targets.to("xpu")
+                
+        if hasattr(torch.xpu, 'synchronize'):
+            torch.xpu.synchronize()
+              
+        del cpu_data, cpu_targets, all_data, all_targets
+        import gc
+        gc.collect()
+        
+        print(f"Preload complete. XPU tensor device: {self.xpu_data.device}")
+        print(f"XPU memory allocated: {torch.xpu.memory_allocated() / 1e9:.2f} GB")
+        print(f"Dataset shape: {self.xpu_data.shape}")
 
     def __len__(self):
         return len(self.df)
@@ -181,12 +268,15 @@ class HG38Dataset(torch.utils.data.Dataset):
         return torch.where(x == old_value, new_value, x)
 
     def __getitem__(self, idx):
+       
+        if self.xpu_data is not None:
+            return self.xpu_data[idx], self.xpu_targets[idx]
         """Returns a sequence of specified len"""
         # sample a random row from df
         row = self.df.iloc[idx]
-        # row = (chr, start, end, split)
-        chr_name, start, end = (row[0], row[1], row[2])
-
+       
+        chr_name, start, end = row['chr_name'], row['start'], row['end']
+        
         seq = self.fasta(chr_name, start, end, max_length=self.max_length, return_augs=self.return_augs)
 
         if self.tokenizer_name == 'char':
